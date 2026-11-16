@@ -1,0 +1,59 @@
+
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NEXUS E-commerce Event",
+  "description": "Contract for NEXUS streaming events",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_time",
+    "customer_id",
+    "product_id",
+    "quantity",
+    "unit_price",
+    "total_amount",
+    "currency"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "order_created",
+        "payment_completed",
+        "order_cancelled"
+      ]
+    },
+    "event_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "customer_id": {
+      "type": "string"
+    },
+    "product_id": {
+      "type": "string"
+    },
+    "quantity": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "unit_price": {
+      "type": "number",
+      "minimum": 0
+    },
+    "total_amount": {
+      "type": "number",
+      "minimum": 0
+    },
+    "currency": {
+      "type": "string",
+      "const": "EUR"
+    }
+  }
+}
