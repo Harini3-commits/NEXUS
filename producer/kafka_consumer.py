@@ -1,7 +1,9 @@
 
+import base64
 import json
+from datetime import datetime, timezone
 
-from confluent_kafka import Consumer, KafkaException
+from confluent_kafka import Consumer, Producer, KafkaException
 
 from producer.validator import validate_event
 from producer.deduplication import (
@@ -11,33 +13,105 @@ from producer.deduplication import (
 )
 
 
-# 1. Configuration du consumer Kafka
-config = {
+# 1. Configuration Kafka Consumer
+consumer_config = {
     "bootstrap.servers": "localhost:9092",
     "group.id": "nexus-sqlite-consumer-group",
     "auto.offset.reset": "earliest",
     "enable.auto.commit": False,
 }
 
-consumer = Consumer(config)
-
-TOPIC = "nexus.orders"
+consumer = Consumer(consumer_config)
 
 
+# 2. Configuration du producteur DLQ
+dlq_producer = Producer({
+    "bootstrap.servers": "localhost:9092"
+})
+
+SOURCE_TOPIC = "nexus.orders"
+DLQ_TOPIC = "nexus.orders.dlq"
+
+
+# 3. Envoi d'un événement invalide dans la DLQ
+def publish_to_dlq(message, error):
+
+    raw_value = message.value() or b""
+    original_key = message.key()
+
+    if isinstance(original_key, bytes):
+        original_key = original_key.decode(
+            "utf-8",
+            errors="replace"
+        )
+
+    dlq_event = {
+        "error": str(error),
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+        "source": {
+            "topic": message.topic(),
+            "partition": message.partition(),
+            "offset": message.offset(),
+        },
+        "original_key": original_key,
+        "original_value_base64": base64.b64encode(
+            raw_value
+        ).decode("ascii"),
+    }
+
+    delivery_status = {
+        "error": None
+    }
+
+    def delivery_report(err, delivered_message):
+        delivery_status["error"] = err
+
+    # Clé déterministe : topic + partition + offset
+    dlq_key = (
+        f"{message.topic()}:"
+        f"{message.partition()}:"
+        f"{message.offset()}"
+    )
+
+    dlq_producer.produce(
+        DLQ_TOPIC,
+        key=dlq_key,
+        value=json.dumps(dlq_event),
+        callback=delivery_report
+    )
+
+    remaining = dlq_producer.flush(10)
+
+    if remaining != 0:
+        raise RuntimeError(
+            "DLQ delivery timeout: message not confirmed"
+        )
+
+    if delivery_status["error"] is not None:
+        raise RuntimeError(
+            f"DLQ delivery failed: {delivery_status['error']}"
+        )
+
+    print(
+        f"DLQ PUBLISHED: "
+        f"source_offset={message.offset()}"
+    )
+
+
+# 4. Traitement principal
 def main():
 
-    # 2. Initialisation de SQLite
     initialize_database()
 
-    print("NEXUS KAFKA-SQLITE CONSUMER STARTED")
-    print("Waiting for messages...\n")
+    consumer.subscribe([SOURCE_TOPIC])
 
-    consumer.subscribe([TOPIC])
+    print("NEXUS KAFKA-SQLITE CONSUMER STARTED")
+    print("DLQ enabled")
+    print("Waiting for messages...\n")
 
     try:
         while True:
 
-            # 3. Lecture d'un message Kafka
             message = consumer.poll(1.0)
 
             if message is None:
@@ -46,42 +120,58 @@ def main():
             if message.error():
                 raise KafkaException(message.error())
 
+            # 5. Décodage et validation des données
             try:
-                # 4. Décodage JSON
                 event = json.loads(
                     message.value().decode("utf-8")
                 )
 
-                # 5. Validation du contrat
                 validate_event(event)
 
-                event_id = event["event_id"]
-                amount = event["total_amount"]
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as error:
 
-                # 6. Traitement idempotent dans SQLite
-                processed = process_event(event_id, amount)
+                print(f"INVALID EVENT: {error}")
 
-                if processed:
-                    print(f"PROCESSED: {event_id}")
-                    print(f"Revenue: {get_revenue():.2f} EUR")
+                # On publie d'abord dans la DLQ
+                publish_to_dlq(message, error)
 
-                else:
-                    print(f"DUPLICATE IGNORED: {event_id}")
-
-                # 7. Commit Kafka après le traitement SQLite
+                # On valide l'offset seulement après confirmation
                 consumer.commit(
                     message=message,
                     asynchronous=False
                 )
 
-            except (ValueError, json.JSONDecodeError) as error:
-                print(f"EVENT REJECTED: {error}")
-                raise
+                print("INVALID EVENT ACKNOWLEDGED")
+                continue
+
+            # 6. Traitement SQLite
+            event_id = event["event_id"]
+            amount = event["total_amount"]
+
+            processed = process_event(event_id, amount)
+
+            if processed:
+                print(f"PROCESSED: {event_id}")
+                print(f"Revenue: {get_revenue():.2f} EUR")
+
+            else:
+                print(f"DUPLICATE IGNORED: {event_id}")
+
+            # 7. Commit après traitement SQLite
+            consumer.commit(
+                message=message,
+                asynchronous=False
+            )
 
     except KeyboardInterrupt:
         print("\nStopping consumer...")
 
     finally:
+        dlq_producer.flush(10)
         consumer.close()
         print("NEXUS CONSUMER STOPPED")
 
